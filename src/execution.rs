@@ -1,4 +1,5 @@
 pub mod import;
-mod runtime;
+pub mod runtime;
 mod store;
 pub mod value;
+pub mod wasi;
