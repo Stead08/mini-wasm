@@ -1,7 +1,7 @@
 use super::{
     opcode::Opcode,
     section::{Function, SectionCode},
-    types::{Export, ExportDesc, FuncType, FunctionLocal, ValueType},
+    types::{Export, ExportDesc, FuncType, FunctionLocal, Import, ImportDesc, ValueType},
 };
 
 use crate::binary::instruction::Instruction;
@@ -12,7 +12,7 @@ use nom::{
     sequence::pair,
     IResult,
 };
-use nom_leb128::leb128_u32;
+use nom_leb128::{leb128_i32, leb128_u32};
 use num_traits::FromPrimitive as _;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -23,6 +23,7 @@ pub struct Module {
     pub function_section: Option<Vec<u32>>,
     pub code_section: Option<Vec<Function>>,
     pub export_section: Option<Vec<Export>>,
+    pub import_section: Option<Vec<Import>>,
 }
 
 impl Default for Module {
@@ -34,6 +35,7 @@ impl Default for Module {
             function_section: None,
             code_section: None,
             export_section: None,
+            import_section: None,
         }
     }
 }
@@ -82,6 +84,10 @@ impl Module {
                         SectionCode::Export => {
                             let (_, exports) = decode_export_section(section_contents)?;
                             module.export_section = Some(exports);
+                        }
+                        SectionCode::Import => {
+                            let (_, imports) = decode_import_section(section_contents)?;
+                            module.import_section = Some(imports);
                         }
                         _ => todo!(),
                     };
@@ -198,11 +204,24 @@ fn decode_instructions(input: &[u8]) -> IResult<&[u8], Instruction> {
             let (rest, idx) = leb128_u32(input)?;
             (rest, Instruction::LocalGet(idx))
         }
+        Opcode::I32Store => {
+            let (rest, align) = leb128_u32(input)?;
+            let (rest, offset) = leb128_u32(rest)?;
+            (rest, Instruction::I32Store { align, offset })
+        }
+        Opcode::I32Const => {
+            let (rest, value) = leb128_i32(input)?;
+            (rest, Instruction::I32Const(value))
+        }
         Opcode::I32Add => (input, Instruction::I32Add),
         Opcode::End => (input, Instruction::End),
         Opcode::Call => {
             let (rest, idx) = leb128_u32(input)?;
             (rest, Instruction::Call(idx))
+        }
+        Opcode::LocalSet => {
+            let (rest, idx) = leb128_u32(input)?;
+            (rest, Instruction::LocalSet(idx))
         }
     };
     Ok((rest, inst))
@@ -213,9 +232,7 @@ fn decode_export_section(input: &[u8]) -> IResult<&[u8], Vec<Export>> {
     let mut exports = vec![];
 
     for _ in 0..count {
-        let (rest, name_len) = leb128_u32(input)?;
-        let (rest, name_bytes) = take(name_len)(rest)?;
-        let name = String::from_utf8(name_bytes.to_vec()).expect("invaid utf-8 string");
+        let (rest, name) = decode_name(input)?;
         let (rest, export_kind) = le_u8(rest)?;
         let (rest, idx) = leb128_u32(rest)?;
         let desc = match export_kind {
@@ -228,13 +245,49 @@ fn decode_export_section(input: &[u8]) -> IResult<&[u8], Vec<Export>> {
 
     Ok((input, exports))
 }
+
+fn decode_name(input: &[u8]) -> IResult<&[u8], String> {
+    let (input, size) = leb128_u32(input)?;
+    let (input, name) = take(size)(input)?;
+    Ok((
+        input,
+        String::from_utf8(name.to_vec()).expect("invalid utf-8 string"),
+    ))
+}
+
+fn decode_import_section(input: &[u8]) -> IResult<&[u8], Vec<Import>> {
+    let (mut input, count) = leb128_u32(input)?;
+    let mut imports = vec![];
+
+    for _ in 0..count {
+        let (rest, module) = decode_name(input)?;
+        let (rest, field) = decode_name(rest)?;
+        let (rest, import_kind) = le_u8(rest)?;
+        let (rest, desc) = match import_kind {
+            0x00 => {
+                let (rest, idx) = leb128_u32(rest)?;
+                (rest, ImportDesc::Func(idx))
+            }
+            _ => unimplemented!("unsupported import kind: {:?}", import_kind),
+        };
+        imports.push(Import {
+            module,
+            field,
+            desc,
+        });
+
+        input = rest;
+    }
+
+    Ok((&[], imports))
+}
 #[cfg(test)]
 mod tests {
     use crate::binary::{
         instruction::Instruction,
         module::Module,
         section::Function,
-        types::{Export, ExportDesc, FuncType, FunctionLocal, ValueType},
+        types::{Export, ExportDesc, FuncType, FunctionLocal, Import, ImportDesc, ValueType},
     };
     use anyhow::Result;
 
@@ -380,6 +433,69 @@ mod tests {
                 export_section: Some(vec![Export {
                     name: "call_doubler".into(),
                     desc: ExportDesc::Func(0),
+                }]),
+                ..Default::default()
+            }
+        );
+        Ok(())
+    }
+    #[test]
+    fn decode_import() -> Result<()> {
+        let wasm = wat::parse_file("src/fixtures/import.wat")?;
+        let module = Module::new(&wasm)?;
+        assert_eq!(
+            module,
+            Module {
+                type_section: Some(vec![FuncType {
+                    params: vec![ValueType::I32],
+                    results: vec![ValueType::I32],
+                }]),
+                import_section: Some(vec![Import {
+                    module: "env".into(),
+                    field: "add".into(),
+                    desc: ImportDesc::Func(0),
+                }]),
+                export_section: Some(vec![Export {
+                    name: "call_add".into(),
+                    desc: ExportDesc::Func(1),
+                }]),
+                function_section: Some(vec![0]),
+                code_section: Some(vec![Function {
+                    locals: vec![],
+                    code: vec![
+                        Instruction::LocalGet(0),
+                        Instruction::Call(0),
+                        Instruction::End
+                    ],
+                }]),
+                ..Default::default()
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn decode_i32_store() -> Result<()> {
+        let wasm = wat::parse_str("(module (func (i32.store offset=4 (i32.const 4))))")?;
+        let module = Module::new(&wasm)?;
+        assert_eq!(
+            module,
+            Module {
+                type_section: Some(vec![FuncType {
+                    params: vec![],
+                    results: vec![],
+                }]),
+                function_section: Some(vec![0]),
+                code_section: Some(vec![Function {
+                    locals: vec![],
+                    code: vec![
+                        Instruction::I32Const(4),
+                        Instruction::I32Store {
+                            align: 2,
+                            offset: 4
+                        },
+                        Instruction::End
+                    ],
                 }]),
                 ..Default::default()
             }
